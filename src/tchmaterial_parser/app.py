@@ -92,14 +92,22 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
         return icon_image
 
     icon_image = set_icon() # 设置窗口图标
+    exit_requested = False
 
     def on_closing() -> None: # 处理窗口关闭事件
+        nonlocal exit_requested
         if runtime.app_closing:
             return
 
-        if not all(state["finished"] for state in download_panel.download_states): # 当正在下载时，询问用户
-            if not messagebox.askokcancel("提示", "下载任务未完成，是否退出？"):
+        if not exit_requested and download_panel.downloads_active():
+            if not messagebox.askokcancel("提示", "仍有任务未完成。退出将停止下载，已完成的文件会保留。是否退出？"):
                 return
+        exit_requested = True
+        if download_panel._batch_running:
+            download_panel.stop_downloads()
+            # 保持事件循环运行，让工作线程清理临时文件后再销毁窗口。
+            root.after(100, on_closing)
+            return
 
         runtime.app_closing = True
 
@@ -253,10 +261,13 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     status_frame.pack(side="bottom", fill="x", pady=(scaled(12), 0))
     status_frame.columnconfigure(0, weight=1)
 
-    progress_label = ttk.Label(status_frame, text="等待下载", style="Caption.TLabel") # 添加下载进度标签
-    progress_label.grid(row=0, column=0, sticky="w")
+    progress_label = ttk.Label(status_frame, text="等待下载", style="Caption.TLabel", wraplength=scaled(480))
+    progress_label.grid(row=0, column=0, sticky="ew")
+    progress_label.bind("<Configure>", lambda event: progress_label.config(wraplength=event.width))
+    manager_btn = ttk.Button(status_frame, text="下载管理", command=download_panel.show_download_manager)
+    manager_btn.grid(row=0, column=1, sticky="e", padx=(scaled(8), 0))
     download_progress_bar = ttk.Progressbar(status_frame, mode="determinate") # 添加下载进度条
-    download_progress_bar.grid(row=1, column=0, sticky="ew", pady=(scaled(6), 0))
+    download_progress_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(scaled(6), 0))
 
     # 底部操作栏：左侧为辅助操作，右侧为主要操作
     button_frame = ttk.Frame(container_frame)
@@ -282,6 +293,7 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
 
     # 下载相关的控件全部就位后，写入下载面板模块，供其中的解析与下载流程使用
     download_panel.bind_widgets(url_text, bookmark_var, download_btn, copy_btn, download_progress_bar, progress_label)
+    download_panel.monitor_downloads()
 
     # 最后打包内容区，使其占据剩余的全部空间
     paned.pack(side="top", fill="both", expand=True, pady=(scaled(14), 0))

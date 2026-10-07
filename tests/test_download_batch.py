@@ -21,6 +21,9 @@ class DownloadBatchTest(unittest.TestCase):
         self.root_directory.mkdir(exist_ok=True)
         self.directory = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
         self.context.enter_context(patch.object(panel, "download_states", []))
+        self.context.enter_context(patch.object(panel, "_batch_running", False))
+        self.context.enter_context(patch.object(panel, "_parsing_download", False))
+        self.context.enter_context(patch.object(panel, "_stop_requested", threading.Event()))
         for name in ("progress_label", "download_progress_bar", "download_btn"):
             self.context.enter_context(patch.object(panel, name, Mock(), create=True))
         self.notice = self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
@@ -65,16 +68,16 @@ class DownloadBatchTest(unittest.TestCase):
             self.assertTrue(entered.wait(timeout=3))
             self.assertTrue(panel.downloads_active())
             self.assertTrue(self.callbacks.empty())
-            panel.download_btn.config.assert_not_called()
+            panel.download_btn.config.assert_called_once_with(state="normal", text="停止下载")
             release.set()
             self.finish()
 
         self.assertEqual(observed, [5] * 5)
-        self.warning.assert_called_once()
+        self.warning.assert_not_called()
         self.notice.assert_not_called()
-        panel.download_btn.config.assert_called_once_with(state="normal", text="下载")
+        panel.download_btn.config.assert_any_call(state="normal", text="下载")
 
-    def test_concurrent_downloads_emit_one_batch_notice(self):
+    def test_concurrent_failures_are_retained_without_modal_notices(self):
         barrier = threading.Barrier(2)
 
         class Response:
@@ -85,11 +88,12 @@ class DownloadBatchTest(unittest.TestCase):
             def close(self):
                 barrier.wait(timeout=3)
 
-        with patch.object(panel, "request_download", side_effect=lambda url: (Response(), [url])):
+        with patch.object(panel, "request_download", side_effect=lambda url, cancel: (Response(), [url])):
             panel.start_download_batch(self.targets(2), self.directory)
             self.finish()
 
-        self.warning.assert_called_once()
+        self.warning.assert_not_called()
+        self.notice.assert_not_called()
         self.assertFalse(panel.downloads_active())
         self.assertTrue(all(state["failed_reason"] for state in panel.download_states))
 
@@ -110,7 +114,8 @@ class DownloadBatchTest(unittest.TestCase):
         self.assertEqual(requested, [targets[1][0].url]) # 只下载缺失的那个文件
         self.assertEqual([state["skipped"] for state in panel.download_states], [True, False, True])
         self.assertEqual(Path(targets[0][1]).read_bytes(), b"old") # 已有文件保持原样
-        self.notice.assert_called_once_with("下载完成", f"文件已下载到：{self.directory}\n已跳过 2 个此前已下载完成的文件。")
+        self.notice.assert_not_called()
+        self.assertIn("已存在 2", panel.download_summary(panel.download_states))
 
     def test_skipping_every_file_needs_no_download_thread(self):
         targets = self.targets(2)
@@ -123,7 +128,8 @@ class DownloadBatchTest(unittest.TestCase):
 
         self.assertEqual(self.threads, [])
         self.assertFalse(panel.downloads_active())
-        self.notice.assert_called_once_with("下载完成", f"文件已下载到：{self.directory}\n已跳过 2 个此前已下载完成的文件。")
+        self.notice.assert_not_called()
+        self.assertIn("已存在 2", panel.download_summary(panel.download_states))
 
     def test_stop_keeps_finished_files_and_discards_unfinished_ones(self):
         targets = self.targets(4)
@@ -153,7 +159,7 @@ class DownloadBatchTest(unittest.TestCase):
             def close(self):
                 pass
 
-        def request_download(url):
+        def request_download(url, cancel):
             return (CompleteResponse() if url.endswith("/0.pdf") else BlockingResponse()), [url]
 
         with patch.object(panel, "request_download", side_effect=request_download):
@@ -172,7 +178,7 @@ class DownloadBatchTest(unittest.TestCase):
         self.assertEqual(finished_path.read_bytes(), b"abc")
         # 未完成的文件不留下半截内容，也不留下临时文件
         self.assertEqual([path.name for path in Path(self.directory).iterdir()], [finished_path.name])
-        self.notice.assert_called_once_with("下载已停止", f"下载已停止。\n文件已下载到：{self.directory}")
+        self.notice.assert_not_called()
         panel.download_btn.config.assert_any_call(state="normal", text="下载")
 
     def test_successful_batch_creates_subdirectories_and_reports_root(self):
@@ -187,11 +193,11 @@ class DownloadBatchTest(unittest.TestCase):
                 pass
 
         targets = [(resource, str(Path(self.directory) / resource.title / "book.pdf")) for resource, _ in self.targets(2)]
-        with patch.object(panel, "request_download", side_effect=lambda url: (Response(), [url])):
+        with patch.object(panel, "request_download", side_effect=lambda url, cancel: (Response(), [url])):
             panel.start_download_batch(targets, self.directory)
             self.finish()
 
-        self.notice.assert_called_once_with("下载完成", f"文件已下载到：{self.directory}")
+        self.notice.assert_not_called()
         self.warning.assert_not_called()
         for _, path in targets:
             self.assertEqual(Path(path).read_bytes(), b"ok")
